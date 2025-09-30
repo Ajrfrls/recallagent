@@ -7,5 +7,6 @@ Fitur:
 - Buy / Sell single
 - Batch Buy / Batch Sell
 - Auto-refresh dashboard
+- Token to Token
 
-> API key disimpan di `.env` (jangan di-push ke repo).# recall-agent-sztch
+BUG (chain arbitrum tidak bisa transaksi)
