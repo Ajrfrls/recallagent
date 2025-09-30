@@ -356,8 +356,7 @@ def menu():
         print("3) SELL (single)")
         print("4) BATCH BUY")
         print("5) BATCH SELL")
-        print("6) TOKEN↔TOKEN (single, cross-chain OK)")
-        print("7) CONTOH: WETH(arb) → WMATIC(poly)")
+        print("6) TOKEN to TOKEN (singke)")
         print("0) KELUAR")
         print(f"(Dashboard auto-refresh tiap {REFRESH_INTERVAL} detik jika tidak ada input)")
 
