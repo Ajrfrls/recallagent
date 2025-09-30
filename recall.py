@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 import os, sys, json, time, requests, select
 from dotenv import load_dotenv
@@ -126,7 +127,7 @@ def history():
     else:
         print("Belum ada history.")
 
-# ===== trade =====
+# ===== trade core =====
 def execute(from_chain, to_chain, from_t, to_t, amt, reason):
     meta_from = CHAINS[from_chain]
     meta_to   = CHAINS[to_chain]
@@ -134,7 +135,7 @@ def execute(from_chain, to_chain, from_t, to_t, amt, reason):
         "fromToken": str(from_t),
         "toToken":   str(to_t),
         "amount":    str(amt),
-        "slippageTolerance": SLIPPAGE_ENV,  # <<< pakai dari .env
+        "slippageTolerance": SLIPPAGE_ENV,
         "fromChain": meta_from["family"],      "toChain": meta_to["family"],
         "fromSpecificChain": meta_from["specific"], "toSpecificChain": meta_to["specific"],
         "reason": reason
@@ -160,55 +161,112 @@ def execute(from_chain, to_chain, from_t, to_t, amt, reason):
     except Exception as e:
         print(r.text, e)
 
-# ===== PNL unrealized (skip stablecoins) =====
+# ===== helpers extra =====
+def get_balance_amount(specific_chain, token_symbol_or_addr):
+    """cek saldo token di chain tertentu (by symbol/addr)"""
+    bals = balance_raw()
+    token_upper = (token_symbol_or_addr or "").upper()
+    token_lower = (token_symbol_or_addr or "").lower()
+    for b in bals:
+        if b.get("specificChain") != specific_chain:
+            continue
+        sym = (b.get("symbol") or "").upper()
+        addr = (b.get("address") or "").lower()
+        if sym == token_upper or (token_lower and addr == token_lower):
+            try:
+                return float(b.get("amount",0))
+            except:
+                return 0.0
+    return 0.0
+
+# ===== PNL unrealized (improved; all swaps; addr-aware) =====
 def pnl_unrealized():
-    STABLES = {"USDC", "USDBC", "USDT"}  # tidak dihitung PNL
+    STABLES = {"USDC","USDBC","USDT"}
+
+    def addr(x):  return (x or "").lower()
+    def symu(x):  return (x or "").upper()
 
     trades = fetch_trades_all()
-    buy_data = {}
-    for t in trades:
-        reason = (t.get("reason") or "").upper()
-        if "BUY" in reason:
-            sym   = (t.get("toTokenSymbol") or "?").upper()
-            chain = t.get("toSpecificChain") or t.get("toChain") or "?"
-            if sym in STABLES:
-                continue
-            key   = f"{sym}-{chain}"
-            amt   = float(t.get("toAmount") or 0.0)
-            usd   = float(t.get("tradeAmountUsd") or 0.0)
-            if amt > 0:
-                if key not in buy_data:
-                    buy_data[key] = {"amount": 0.0, "usd": 0.0}
-                buy_data[key]["amount"] += amt
-                buy_data[key]["usd"]    += usd
 
+    # posisi akumulatif per (tokenAddrOrSym, chain)
+    pos = {}  # key -> {"amt": float, "cost": float}
+
+    def add_pos(key, amount, usd_cost):
+        if key not in pos:
+            pos[key] = {"amt":0.0, "cost":0.0}
+        if amount > 0:  # buy
+            pos[key]["amt"]  += amount
+            pos[key]["cost"] += usd_cost
+        elif amount < 0:  # sell
+            if pos[key]["amt"] <= 0:
+                return
+            avg = pos[key]["cost"]/pos[key]["amt"] if pos[key]["amt"] else 0.0
+            take_amt = min(-amount, pos[key]["amt"])
+            pos[key]["amt"]  -= take_amt
+            pos[key]["cost"] -= avg * take_amt
+
+    # bangun posisi dari semua trade
+    for t in trades:
+        to_chain   = (t.get("toSpecificChain")   or t.get("toChain")   or "?")
+        from_chain = (t.get("fromSpecificChain") or t.get("fromChain") or "?")
+
+        to_addr   = addr(t.get("toTokenAddress"))
+        from_addr = addr(t.get("fromTokenAddress"))
+
+        to_sym   = symu(t.get("toTokenSymbol"))
+        from_sym = symu(t.get("fromTokenSymbol"))
+
+        to_amt   = float(t.get("toAmount") or 0.0)
+        from_amt = float(t.get("fromAmount") or 0.0)
+        usd      = float(t.get("tradeAmountUsd") or 0.0)
+
+        to_key   = (to_addr or to_sym, to_chain)
+        from_key = (from_addr or from_sym, from_chain)
+
+        # skip jika keduanya stable
+        if to_sym in STABLES and from_sym in STABLES:
+            continue
+
+        if to_amt > 0 and to_sym not in STABLES:
+            add_pos(to_key, to_amt, usd)
+        if from_amt > 0 and from_sym not in STABLES:
+            add_pos(from_key, -from_amt, 0.0)
+
+    # baca balance sekarang, hitung PNL unrealized
     bals = balance_raw()
     rows, total_pnl = [], 0.0
     for b in bals:
         sym_raw = b.get("symbol") or "?"
-        sym     = sym_raw.upper()
-        if sym in STABLES:
+        if symu(sym_raw) in STABLES:
             continue
         chain = b.get("specificChain") or "?"
-        key   = f"{sym}-{chain}"
-        amt   = float(b.get("amount") or 0.0)
-        val   = float(b.get("value")  or 0.0)
+        b_addr = addr(b.get("address"))
+        key = (b_addr or symu(sym_raw), chain)
 
-        if key in buy_data and amt > 0:
-            avg_buy_price = buy_data[key]["usd"] / buy_data[key]["amount"]
-            cost_basis    = amt * avg_buy_price
-            pnl_val       = val - cost_basis
-            pnl_str = f"{Fore.GREEN}{pnl_val:.2f}{Style.RESET_ALL}" if pnl_val >= 0 else f"{Fore.RED}{pnl_val:.2f}{Style.RESET_ALL}"
-            rows.append([sym_raw, chain, round(amt,6), round(avg_buy_price,4), round(val,2), pnl_str])
-            total_pnl += pnl_val
+        amt_now = float(b.get("amount") or 0.0)
+        val_now = float(b.get("value")  or 0.0)
+        p = pos.get(key)
+        if not p or amt_now <= 0:
+            continue
+
+        if p["amt"] > 0:
+            avg_cost = p["cost"]/p["amt"]
+            cost_now = avg_cost * amt_now
+        else:
+            continue
+
+        pnl_val = val_now - cost_now
+        pnl_str = f"{Fore.GREEN}{pnl_val:.2f}{Style.RESET_ALL}" if pnl_val>=0 else f"{Fore.RED}{pnl_val:.2f}{Style.RESET_ALL}"
+        rows.append([sym_raw, chain, round(amt_now,6), round(avg_cost,4), round(val_now,2), pnl_str])
+        total_pnl += pnl_val
 
     print_title("Unrealized PNL")
     if rows:
         print(tabulate(rows, headers=["Token","Chain","Amount","Avg Buy $","Cur Val $","Unreal PNL $"], tablefmt="pretty"))
-        total_str = f"{Fore.GREEN}{total_pnl:.2f}{Style.RESET_ALL}" if total_pnl >= 0 else f"{Fore.RED}{total_pnl:.2f}{Style.RESET_ALL}"
+        total_str = f"{Fore.GREEN}{total_pnl:.2f}{Style.RESET_ALL}" if total_pnl>=0 else f"{Fore.RED}{total_pnl:.2f}{Style.RESET_ALL}"
         print(f"\nTotal Unrealized PNL: {Style.BRIGHT}{total_str}{Style.RESET_ALL} USD")
     else:
-        print("Belum ada posisi token non-stable yang bisa dihitung PNL.")
+        print("Belum ada posisi non-stable yang terhitung PNL.")
 
 # ===== batch buy/sell =====
 def batch_buy():
@@ -243,6 +301,47 @@ def batch_sell():
         sold += amt
         time.sleep(2)
 
+# ===== token↔token (single) same/cross-chain =====
+def token_to_token_single():
+    from_chain = pick_chain("Dari Chain (Token sumber)")
+    to_chain   = pick_chain("Ke Chain (Token tujuan)")
+    if not from_chain or not to_chain:
+        input("\n[Enter untuk lanjut]")
+        return
+
+    frm    = input("fromToken (alamat/simbol/addr): ").strip()
+    to     = input("toToken (alamat/simbol/addr): ").strip()
+    amt_in = input("Jumlah token sumber: ").strip()
+    reason = input("Reason (opsional): ").strip() or f"T2T {from_chain}->{to_chain}"
+
+    # sanity saldo (opsional)
+    try:
+        have = get_balance_amount(CHAINS[from_chain]["specific"], frm)
+        if have and float(amt_in) > have + 1e-9:
+            print(f"{Fore.YELLOW}[WARN]{Style.RESET_ALL} Saldo {frm} {have} < {amt_in}")
+    except:
+        pass
+
+    execute(from_chain, to_chain, frm, to, amt_in, reason)
+    input("\n[Enter untuk lanjut]")
+
+# ===== contoh preset cross-chain (WETH arb -> WMATIC polygon) =====
+def token_to_token_cross_example():
+    from_chain = "arbitrum"
+    to_chain   = "polygon"
+    WETH_ARB   = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+    WMATIC_POL = "0x0d500B1d8E8Ef31E21C99d1Db9A6444d3ADf1270"
+    amt_in     = "0.05"
+    reason     = f"T2T_XCHAIN {from_chain}->{to_chain}"
+    try:
+        have = get_balance_amount(CHAINS[from_chain]["specific"], WETH_ARB)
+        if have and float(amt_in) > have + 1e-9:
+            print(f"{Fore.YELLOW}[WARN]{Style.RESET_ALL} Saldo WETH Arbitrum {have} < {amt_in}")
+    except:
+        pass
+    execute(from_chain, to_chain, WETH_ARB, WMATIC_POL, amt_in, reason)
+    input("\n[Enter untuk lanjut]")
+
 # ===== menu (dashboard auto-refresh) =====
 def menu():
     while True:
@@ -257,6 +356,8 @@ def menu():
         print("3) SELL (single)")
         print("4) BATCH BUY")
         print("5) BATCH SELL")
+        print("6) TOKEN↔TOKEN (single, cross-chain OK)")
+        print("7) CONTOH: WETH(arb) → WMATIC(poly)")
         print("0) KELUAR")
         print(f"(Dashboard auto-refresh tiap {REFRESH_INTERVAL} detik jika tidak ada input)")
 
@@ -271,7 +372,7 @@ def menu():
             elif c=="2":
                 from_chain = pick_chain("Dari Chain (USDC sumber)")
                 to_chain   = pick_chain("Ke Chain (Token tujuan)")
-                if not from_chain or not to_chain: 
+                if not from_chain or not to_chain:
                     input("\n[Enter untuk lanjut]"); 
                     continue
                 to     = input("toToken (alamat/simbol): ").strip()
@@ -282,7 +383,7 @@ def menu():
             elif c=="3":
                 from_chain = pick_chain("Dari Chain (Token sumber)")
                 to_chain   = pick_chain("Ke Chain (USDC tujuan)")
-                if not from_chain or not to_chain: 
+                if not from_chain or not to_chain:
                     input("\n[Enter untuk lanjut]"); 
                     continue
                 frm    = input("fromToken (alamat/simbol): ").strip()
@@ -294,6 +395,10 @@ def menu():
                 batch_buy();  input("\n[Enter untuk lanjut]")
             elif c=="5":
                 batch_sell(); input("\n[Enter untuk lanjut]")
+            elif c=="6":
+                token_to_token_single()
+            elif c=="7":
+                token_to_token_cross_example()
             elif c=="0":
                 print("bye 👋"); sys.exit(0)
             else:
@@ -305,3 +410,4 @@ def menu():
 # ===== entry =====
 if __name__ == "__main__":
     menu()
+
